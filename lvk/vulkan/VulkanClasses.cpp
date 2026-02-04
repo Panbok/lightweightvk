@@ -4734,7 +4734,7 @@ const VkSamplerYcbcrConversionInfo* lvk::VulkanContext::getOrCreateYcbcrConversi
   const VkFormat vkFormat = lvk::formatToVkFormat(format);
 
   VkFormatProperties2 props = {
-		.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+      .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
   };
   vkGetPhysicalDeviceFormatProperties2(getVkPhysicalDevice(), vkFormat, &props);
 
@@ -6282,7 +6282,6 @@ void lvk::VulkanContext::createInstance() {
 
   enabledInstanceExtensionNames_ = {
       VK_KHR_SURFACE_EXTENSION_NAME,
-      VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME, // remove once VK_KHR_surface_maintenance1 becomes mandatory
 #if defined(_WIN32)
       VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
 #elif defined(VK_USE_PLATFORM_ANDROID_KHR)
@@ -6319,6 +6318,8 @@ void lvk::VulkanContext::createInstance() {
 
   if (hasExtension(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME, allInstanceExtensions)) {
     enabledInstanceExtensionNames_.push_back(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
+  } else if (hasExtension(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME, allInstanceExtensions)) {
+    enabledInstanceExtensionNames_.push_back(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
   }
 
   if (hasExtension(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME, allInstanceExtensions)) {
@@ -6957,7 +6958,8 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
   addOptionalExtension(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME, has_KHR_ray_tracing_pipeline_, &rayTracingFeatures);
   addOptionalExtension(
       VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME, has_EXT_ray_tracing_invocation_reorder, &rayTracingInvocationReorderFeatures);
-  if (!addOptionalExtension(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME, has_KHR_swapchain_maintenance1_, &swapchainMaintenance1Features))  {
+  if (!addOptionalExtension(
+          VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME, has_KHR_swapchain_maintenance1_, &swapchainMaintenance1Features)) {
     addOptionalExtension(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME, has_KHR_swapchain_maintenance1_, &swapchainMaintenance1Features);
   }
   addOptionalExtension(VK_EXT_HDR_METADATA_EXTENSION_NAME, has_EXT_hdr_metadata_);
@@ -7845,7 +7847,7 @@ void lvk::VulkanContext::querySurfaceCapabilities() {
       VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT, VK_FORMAT_D16_UNORM};
   for (const VkFormat& depthFormat : depthFormats) {
     VkFormatProperties2 props = {
-		  .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+        .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
     };
     vkGetPhysicalDeviceFormatProperties2(vkPhysicalDevice_, depthFormat, &props);
 

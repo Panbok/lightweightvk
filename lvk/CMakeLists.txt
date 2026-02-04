@@ -14,6 +14,10 @@ if(APPLE)
   list(APPEND SRC_FILES ${SRC_FILES_MM})
 endif()
 
+if(NOT LVK_WITH_IMGUI)
+  list(REMOVE_ITEM SRC_FILES "HelpersImGui.cpp")
+endif()
+
 add_library(LVKLibrary ${SRC_FILES} ${HEADER_FILES})
 
 lvk_setup_groups("${SRC_FILES}")

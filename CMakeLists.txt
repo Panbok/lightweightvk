@@ -23,10 +23,12 @@ option(LVK_WITH_SAMPLES_ANDROID    "Generate Android projects for demo apps" OFF
 option(LVK_WITH_TRACY              "Enable Tracy profiler"                   ON)
 option(LVK_WITH_TRACY_GPU          "Enable Tracy GPU profiler"               OFF)
 option(LVK_WITH_WAYLAND            "Enable Wayland"                          OFF)
+option(LVK_WITH_IMGUI              "Enable ImGui helpers"                    OFF)
 option(LVK_WITH_IMPLOT             "Enable ImPlot"                           ON)
 option(LVK_WITH_OPENXR             "Enable OpenXR"                           OFF)
 option(LVK_WITH_ANDROID_VALIDATION "Enable validation layers on Android"     ON)
 option(LVK_WITH_SLANG              "Enable Slang compiler"                   OFF)
+option(LVK_USE_VCPKG_GLFW          "Use glfw3 from find_package() (vcpkg)"   OFF)
 
 cmake_dependent_option(LVK_WITH_VULKAN_PORTABILITY "Enable portability extension" ON "APPLE" OFF)
 
@@ -87,12 +89,14 @@ endfunction()
 # cmake-format: off
 message(STATUS "LVK_DEPLOY_DEPS             = ${LVK_DEPLOY_DEPS}")
 message(STATUS "LVK_WITH_GLFW               = ${LVK_WITH_GLFW}")
+message(STATUS "LVK_USE_VCPKG_GLFW          = ${LVK_USE_VCPKG_GLFW}")
 message(STATUS "LVK_WITH_SAMPLES            = ${LVK_WITH_SAMPLES}")
 message(STATUS "LVK_WITH_SAMPLES_ANDROID    = ${LVK_WITH_SAMPLES_ANDROID}")
 message(STATUS "LVK_WITH_TRACY              = ${LVK_WITH_TRACY}")
 message(STATUS "LVK_WITH_TRACY_GPU          = ${LVK_WITH_TRACY_GPU}")
 message(STATUS "LVK_WITH_VULKAN_PORTABILITY = ${LVK_WITH_VULKAN_PORTABILITY}")
 message(STATUS "LVK_WITH_WAYLAND            = ${LVK_WITH_WAYLAND}")
+message(STATUS "LVK_WITH_IMGUI              = ${LVK_WITH_IMGUI}")
 message(STATUS "LVK_WITH_IMPLOT             = ${LVK_WITH_IMPLOT}")
 message(STATUS "LVK_WITH_OPENXR             = ${LVK_WITH_OPENXR}")
 # cmake-format: on
@@ -189,6 +193,20 @@ endif()
 include_directories(.)
 include_directories(src)
 
+if(LVK_WITH_GLFW AND LVK_USE_VCPKG_GLFW)
+  # Prefer externally-provided GLFW (e.g. vcpkg) to avoid building LVK's vendored copy.
+  find_package(glfw3 CONFIG REQUIRED)
+  if(TARGET glfw)
+    # ok
+  elseif(TARGET glfw::glfw)
+    add_library(glfw ALIAS glfw::glfw)
+  elseif(TARGET glfw3::glfw)
+    add_library(glfw ALIAS glfw3::glfw)
+  else()
+    message(FATAL_ERROR "glfw3 was found, but no usable CMake target was provided.")
+  endif()
+endif()
+
 add_subdirectory(lvk)
 
 target_include_directories(LVKLibrary PUBLIC ${LVK_ROOT_DIR})
@@ -226,7 +244,7 @@ lvk_set_folder(LVKstb "LVK")
 target_link_libraries(LVKLibrary PUBLIC minilog)
 target_include_directories(LVKLibrary PUBLIC "third-party/deps/src")
 
-if(LVK_WITH_GLFW)
+if(LVK_WITH_GLFW AND NOT LVK_USE_VCPKG_GLFW)
   # cmake-format: off
   set(GLFW_BUILD_DOCS     OFF CACHE BOOL "")
   set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "")
@@ -292,5 +310,8 @@ if(LVK_WITH_OPENXR)
   target_include_directories(LVKLibrary PUBLIC "${LVK_ROOT_DIR}/third-party/deps/src/openxr-sdk/include")
 endif()
 
-# ImGui
-target_include_directories(LVKLibrary PUBLIC "${LVK_ROOT_DIR}/third-party/deps/src/imgui")
+# ImGui (optional)
+if(LVK_WITH_IMGUI)
+  target_include_directories(LVKLibrary PUBLIC "${LVK_ROOT_DIR}/third-party/deps/src/imgui")
+  target_compile_definitions(LVKLibrary PUBLIC "LVK_WITH_IMGUI=1")
+endif()
