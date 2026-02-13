@@ -7231,26 +7231,38 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
   querySurfaceCapabilities();
 
 #if defined(LVK_WITH_TRACY_GPU)
+  const PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT fpGetPhysicalDeviceCalibrateableTimeDomainsEXT =
+      (PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT)vkGetInstanceProcAddr(vkInstance_, "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
+  const PFN_vkGetCalibratedTimestampsEXT fpGetCalibratedTimestampsEXT =
+      (PFN_vkGetCalibratedTimestampsEXT)vkGetDeviceProcAddr(vkDevice_, "vkGetCalibratedTimestampsEXT");
+  const PFN_vkResetQueryPoolEXT fpResetQueryPoolEXT = (PFN_vkResetQueryPoolEXT)vkGetDeviceProcAddr(vkDevice_, "vkResetQueryPool");
+
+  const bool hasCalibratedTimestampFns = fpGetPhysicalDeviceCalibrateableTimeDomainsEXT && fpGetCalibratedTimestampsEXT;
+
   std::vector<VkTimeDomainEXT> timeDomains;
 
-  if (has_KHR_calibrated_timestamps_) {
+  if (has_KHR_calibrated_timestamps_ && hasCalibratedTimestampFns) {
     uint32_t numTimeDomains = 0;
-    VK_ASSERT(vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(vkPhysicalDevice_, &numTimeDomains, nullptr));
+    VK_ASSERT(fpGetPhysicalDeviceCalibrateableTimeDomainsEXT(vkPhysicalDevice_, &numTimeDomains, nullptr));
     timeDomains.resize(numTimeDomains);
-    VK_ASSERT(vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(vkPhysicalDevice_, &numTimeDomains, timeDomains.data()));
+    VK_ASSERT(fpGetPhysicalDeviceCalibrateableTimeDomainsEXT(vkPhysicalDevice_, &numTimeDomains, timeDomains.data()));
   }
 
-  const bool hasHostQuery = vkFeatures12_.hostQueryReset && [&timeDomains]() -> bool {
+  bool hasHostQuery = vkFeatures12_.hostQueryReset && [&timeDomains]() -> bool {
     for (VkTimeDomainEXT domain : timeDomains)
       if (domain == VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT || domain == VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT)
         return true;
     return false;
   }();
 
-  if (hasHostQuery) {
+  // Tracy's host-calibrated context requires calibrated timestamps entrypoints
+  // to be available (and loaded). Some loader configurations can leave these
+  // function pointers null even if the extension is present.
+  if (hasHostQuery && fpResetQueryPoolEXT && hasCalibratedTimestampFns) {
     pimpl_->tracyVkCtx_ = TracyVkContextHostCalibrated(
-        vkPhysicalDevice_, vkDevice_, vkResetQueryPool, vkGetPhysicalDeviceCalibrateableTimeDomainsEXT, vkGetCalibratedTimestampsEXT);
+        vkPhysicalDevice_, vkDevice_, fpResetQueryPoolEXT, fpGetPhysicalDeviceCalibrateableTimeDomainsEXT, fpGetCalibratedTimestampsEXT);
   } else {
+    hasHostQuery = false;
     const VkCommandPoolCreateInfo ciCommandPool = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
@@ -7266,13 +7278,13 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
         .commandBufferCount = 1,
     };
     VK_ASSERT(vkAllocateCommandBuffers(vkDevice_, &aiCommandBuffer, &pimpl_->tracyCommandBuffer_));
-    if (has_KHR_calibrated_timestamps_) {
+    if (has_KHR_calibrated_timestamps_ && hasCalibratedTimestampFns) {
       pimpl_->tracyVkCtx_ = TracyVkContextCalibrated(vkPhysicalDevice_,
                                                      vkDevice_,
                                                      deviceQueues_.graphicsQueue,
                                                      pimpl_->tracyCommandBuffer_,
-                                                     vkGetPhysicalDeviceCalibrateableTimeDomainsEXT,
-                                                     vkGetCalibratedTimestampsEXT);
+                                                     fpGetPhysicalDeviceCalibrateableTimeDomainsEXT,
+                                                     fpGetCalibratedTimestampsEXT);
     } else {
       pimpl_->tracyVkCtx_ = TracyVkContext(vkPhysicalDevice_, vkDevice_, deviceQueues_.graphicsQueue, pimpl_->tracyCommandBuffer_);
     };

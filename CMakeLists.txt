@@ -159,9 +159,25 @@ if(LVK_WITH_WAYLAND)
 endif()
 
 if(LVK_WITH_TRACY)
-  add_definitions("-DTRACY_ENABLE=1")
-  add_subdirectory(third-party/deps/src/tracy)
-  lvk_set_folder(TracyClient "third-party")
+  # Prefer an externally-provided Tracy (e.g. via vcpkg in a superbuild) to avoid
+  # relying on LVK's bootstrapped third-party checkout.
+  find_package(Tracy CONFIG QUIET)
+  find_package(tracy CONFIG QUIET)
+
+  set(LVK_TRACY_CLIENT_TARGET "")
+  if(TARGET Tracy::TracyClient)
+    set(LVK_TRACY_CLIENT_TARGET Tracy::TracyClient)
+  elseif(TARGET tracy::tracyclient)
+    set(LVK_TRACY_CLIENT_TARGET tracy::tracyclient)
+  elseif(TARGET unofficial::tracy::tracyclient)
+    set(LVK_TRACY_CLIENT_TARGET unofficial::tracy::tracyclient)
+  elseif(TARGET TracyClient)
+    set(LVK_TRACY_CLIENT_TARGET TracyClient)
+  endif()
+
+  if(NOT LVK_TRACY_CLIENT_TARGET)
+    message(FATAL_ERROR "LVK_WITH_TRACY=ON but no TracyClient target was found. Provide Tracy via your toolchain (e.g. vcpkg). Tried: Tracy::TracyClient, tracy::tracyclient, unofficial::tracy::tracyclient, TracyClient.")
+  endif()
 endif()
 
 if(LVK_WITH_OPENXR)
@@ -213,7 +229,8 @@ target_include_directories(LVKLibrary PUBLIC ${LVK_ROOT_DIR})
 target_include_directories(LVKLibrary PUBLIC ${LVK_ROOT_DIR}/src)
 
 if(LVK_WITH_TRACY)
-  target_link_libraries(LVKVulkan PUBLIC TracyClient)
+  target_link_libraries(LVKVulkan PUBLIC ${LVK_TRACY_CLIENT_TARGET})
+  target_compile_definitions(LVKVulkan PUBLIC TRACY_ENABLE=1)
   target_compile_definitions(LVKVulkan PUBLIC "LVK_WITH_TRACY=1")
   if(LVK_WITH_TRACY_GPU)
     target_compile_definitions(LVKVulkan PUBLIC "LVK_WITH_TRACY_GPU=1")
