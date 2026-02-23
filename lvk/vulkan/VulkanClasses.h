@@ -570,6 +570,7 @@ class VulkanContext final : public IContext {
   void recreateSwapchain(int newWidth, int newHeight) override;
 
   uint32_t getFramebufferMSAABitMask() const override;
+  bool supportsDrawIndexedIndirectCount() const override;
   bool isExtensionEnabled(const char* ext) const override;
 
   double getTimestampPeriodToMs() const override;

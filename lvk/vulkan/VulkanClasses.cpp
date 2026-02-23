@@ -7937,6 +7937,10 @@ uint32_t lvk::VulkanContext::getMaxStorageBufferRange() const {
   return vkPhysicalDeviceProperties2_.properties.limits.maxStorageBufferRange;
 }
 
+bool lvk::VulkanContext::supportsDrawIndexedIndirectCount() const {
+  return vkFeatures12_.drawIndirectCount == VK_TRUE;
+}
+
 bool lvk::VulkanContext::isExtensionEnabled(const char* ext) const {
   for (const char* name : enabledInstanceExtensionNames_) {
     if (strcmp(ext, name) == 0)
