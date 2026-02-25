@@ -26,8 +26,16 @@
 #if defined(LVK_WITH_TRACY_GPU)
   #include "tracy/TracyVulkan.hpp"
   #define LVK_PROFILER_GPU_ZONE(name, ctx, cmdBuffer, color) TracyVkZoneC(ctx->pimpl_->tracyVkCtx_, cmdBuffer, name, color);
+  #if defined(LVK_WITH_TRACY_GPU_DRAW_ZONES)
+    #define LVK_PROFILER_GPU_DRAW_ZONE(name, ctx, cmdBuffer, color) TracyVkZoneC(ctx->pimpl_->tracyVkCtx_, cmdBuffer, name, color);
+  #else
+    // Per-draw GPU zones can overflow Tracy's Vulkan query pool on high draw
+    // count workloads (e.g. non-instanced 32k scenes). Keep them opt-in.
+    #define LVK_PROFILER_GPU_DRAW_ZONE(name, ctx, cmdBuffer, color)
+  #endif
 #else
   #define LVK_PROFILER_GPU_ZONE(name, ctx, cmdBuffer, color)
+  #define LVK_PROFILER_GPU_DRAW_ZONE(name, ctx, cmdBuffer, color)
 #endif // LVK_WITH_TRACY_GPU
 // clang-format on
 
@@ -1240,11 +1248,9 @@ lvk::VulkanSwapchain::VulkanSwapchain(VulkanContext& ctx, uint32_t width, uint32
   for (uint32_t i = 0; i < numSwapchainImages_; i++) {
     acquireSemaphore_[i] = lvk::createSemaphore(device_, "Semaphore: swapchain-acquire");
 
-    if (!ctx_.has_KHR_swapchain_maintenance1_) {
-      char debugNameFence[256] = {0};
-      snprintf(debugNameFence, sizeof(debugNameFence) - 1, "Fence: swapchain %u", i);
-      acquireFence_[i] = lvk::createFence(device_, debugNameFence, true);
-    }
+    char debugNameFence[256] = {0};
+    snprintf(debugNameFence, sizeof(debugNameFence) - 1, "Fence: swapchain %u", i);
+    acquireFence_[i] = lvk::createFence(device_, debugNameFence, true);
 
     snprintf(debugNameImage, sizeof(debugNameImage) - 1, "Image: swapchain %u", i);
     snprintf(debugNameImageView, sizeof(debugNameImageView) - 1, "Image View: swapchain %u", i);
@@ -1286,10 +1292,6 @@ lvk::VulkanSwapchain::~VulkanSwapchain() {
   for (VkSemaphore sem : acquireSemaphore_) {
     vkDestroySemaphore(device_, sem, nullptr);
   }
-  for (VkFence fence : presentFence_) {
-    if (fence)
-      vkDestroyFence(device_, fence, nullptr);
-  }
   for (VkFence fence : acquireFence_) {
     if (fence)
       vkDestroyFence(device_, fence, nullptr);
@@ -1316,36 +1318,33 @@ lvk::TextureHandle lvk::VulkanSwapchain::getCurrentTexture() {
   LVK_PROFILER_FUNCTION();
 
   if (getNextImage_) {
+    VkSemaphore acquireSemaphore = VK_NULL_HANDLE;
+
+    LVK_PROFILER_ZONE("swapchain.acquire", LVK_PROFILER_COLOR_WAIT);
+    VkFence acquireFence = acquireFence_[currentImageIndex_];
+    // Reuse one acquire semaphore/fence pair per rotating slot to avoid
+    // creating sync primitives at runtime.
+    VK_ASSERT(vkWaitForFences(device_, 1, &acquireFence, VK_TRUE, UINT64_MAX));
+    VK_ASSERT(vkResetFences(device_, 1, &acquireFence));
+
+    acquireSemaphore = acquireSemaphore_[currentImageIndex_];
+    // Timeout UINT64_MAX means blocking acquire.
+    VkResult r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, acquireSemaphore, acquireFence, &currentImageIndex_);
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR && r != VK_ERROR_OUT_OF_DATE_KHR) {
+      VK_ASSERT(r);
+    }
+    LVK_PROFILER_ZONE_END();
+
+    LVK_PROFILER_ZONE("swapchain.timeline_wait", LVK_PROFILER_COLOR_WAIT);
     const VkSemaphoreWaitInfo waitInfo = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
         .semaphoreCount = 1,
         .pSemaphores = &ctx_.timelineSemaphore_,
         .pValues = &timelineWaitValues_[currentImageIndex_],
     };
+    // Wait for prior GPU work that targeted the acquired image index.
     VK_ASSERT(vkWaitSemaphores(device_, &waitInfo, UINT64_MAX));
-
-    VkFence acquireFence = VK_NULL_HANDLE;
-
-    if (ctx_.has_KHR_swapchain_maintenance1_) {
-      // VK_KHR_swapchain_maintenance1: before acquiring again, wait for the presentation operation to finish
-      if (presentFence_[currentImageIndex_]) {
-        VK_ASSERT(vkWaitForFences(device_, 1, &presentFence_[currentImageIndex_], VK_TRUE, UINT64_MAX));
-        VK_ASSERT(vkResetFences(device_, 1, &presentFence_[currentImageIndex_]));
-      }
-    } else {
-      // without VK_KHR_swapchain_maintenance1: use acquire fences to synchronize semaphore reuse
-      VK_ASSERT(vkWaitForFences(device_, 1, &acquireFence_[currentImageIndex_], VK_TRUE, UINT64_MAX));
-      VK_ASSERT(vkResetFences(device_, 1, &acquireFence_[currentImageIndex_]));
-
-      acquireFence = acquireFence_[currentImageIndex_];
-    }
-
-    VkSemaphore acquireSemaphore = acquireSemaphore_[currentImageIndex_];
-    // when timeout is set to UINT64_MAX, we wait until the next image has been acquired
-    VkResult r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, acquireSemaphore, acquireFence, &currentImageIndex_);
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR && r != VK_ERROR_OUT_OF_DATE_KHR) {
-      VK_ASSERT(r);
-    }
+    LVK_PROFILER_ZONE_END();
     getNextImage_ = false;
     ctx_.immediate_->waitSemaphore(acquireSemaphore);
   }
@@ -1373,25 +1372,18 @@ lvk::Result lvk::VulkanSwapchain::present(VkSemaphore waitSemaphore) {
   LVK_PROFILER_FUNCTION();
 
   LVK_PROFILER_ZONE("vkQueuePresent()", LVK_PROFILER_COLOR_PRESENT);
-  const VkSwapchainPresentFenceInfoEXT fenceInfo = {
-      .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT,
-      .swapchainCount = 1,
-      .pFences = &presentFence_[currentImageIndex_],
-  };
   const VkPresentInfoKHR pi = {
       .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-      .pNext = ctx_.has_KHR_swapchain_maintenance1_ ? &fenceInfo : nullptr,
+      // Presentation fence chaining is intentionally disabled here.
+      // Acquire-fence/timeline synchronization in getCurrentTexture() keeps
+      // swapchain image reuse and GPU completion ordering correct.
+      .pNext = nullptr,
       .waitSemaphoreCount = 1,
       .pWaitSemaphores = &waitSemaphore,
       .swapchainCount = 1u,
       .pSwapchains = &swapchain_,
       .pImageIndices = &currentImageIndex_,
   };
-  if (ctx_.has_KHR_swapchain_maintenance1_) {
-    if (!presentFence_[currentImageIndex_]) {
-      presentFence_[currentImageIndex_] = lvk::createFence(device_, "Fence: present-fence");
-    }
-  }
   VkResult r = vkQueuePresentKHR(graphicsQueue_, &pi);
   if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR && r != VK_ERROR_OUT_OF_DATE_KHR) {
     VK_ASSERT(r);
@@ -2762,7 +2754,7 @@ void lvk::CommandBuffer::cmdUpdateBuffer(BufferHandle buffer, size_t bufferOffse
 
 void lvk::CommandBuffer::cmdDraw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t baseInstance) {
   LVK_PROFILER_FUNCTION();
-  LVK_PROFILER_GPU_ZONE("cmdDraw()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
+  LVK_PROFILER_GPU_DRAW_ZONE("cmdDraw()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
 
   if (vertexCount == 0) {
     return;
@@ -2777,7 +2769,7 @@ void lvk::CommandBuffer::cmdDrawIndexed(uint32_t indexCount,
                                         int32_t vertexOffset,
                                         uint32_t baseInstance) {
   LVK_PROFILER_FUNCTION();
-  LVK_PROFILER_GPU_ZONE("cmdDrawIndexed()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
+  LVK_PROFILER_GPU_DRAW_ZONE("cmdDrawIndexed()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
 
   if (indexCount == 0) {
     return;
@@ -2790,7 +2782,7 @@ void lvk::CommandBuffer::cmdDrawIndexed(uint32_t indexCount,
 
 void lvk::CommandBuffer::cmdDrawIndirect(BufferHandle indirectBuffer, size_t indirectBufferOffset, uint32_t drawCount, uint32_t stride) {
   LVK_PROFILER_FUNCTION();
-  LVK_PROFILER_GPU_ZONE("cmdDrawIndirect()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
+  LVK_PROFILER_GPU_DRAW_ZONE("cmdDrawIndirect()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
 
   lvk::VulkanBuffer* bufIndirect = ctx_->buffersPool_.get(indirectBuffer);
 
@@ -2805,7 +2797,7 @@ void lvk::CommandBuffer::cmdDrawIndexedIndirect(BufferHandle indirectBuffer,
                                                 uint32_t drawCount,
                                                 uint32_t stride) {
   LVK_PROFILER_FUNCTION();
-  LVK_PROFILER_GPU_ZONE("cmdDrawIndexedIndirect()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
+  LVK_PROFILER_GPU_DRAW_ZONE("cmdDrawIndexedIndirect()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
 
   lvk::VulkanBuffer* bufIndirect = ctx_->buffersPool_.get(indirectBuffer);
 
@@ -2822,7 +2814,7 @@ void lvk::CommandBuffer::cmdDrawIndexedIndirectCount(BufferHandle indirectBuffer
                                                      uint32_t maxDrawCount,
                                                      uint32_t stride) {
   LVK_PROFILER_FUNCTION();
-  LVK_PROFILER_GPU_ZONE("cmdDrawIndexedIndirectCount()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
+  LVK_PROFILER_GPU_DRAW_ZONE("cmdDrawIndexedIndirectCount()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
 
   lvk::VulkanBuffer* bufIndirect = ctx_->buffersPool_.get(indirectBuffer);
   lvk::VulkanBuffer* bufCount = ctx_->buffersPool_.get(countBuffer);
@@ -2841,7 +2833,7 @@ void lvk::CommandBuffer::cmdDrawIndexedIndirectCount(BufferHandle indirectBuffer
 
 void lvk::CommandBuffer::cmdDrawMeshTasks(const Dimensions& threadgroupCount) {
   LVK_PROFILER_FUNCTION();
-  LVK_PROFILER_GPU_ZONE("cmdDrawMeshTasks()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
+  LVK_PROFILER_GPU_DRAW_ZONE("cmdDrawMeshTasks()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
 
   vkCmdDrawMeshTasksEXT(wrapper_->cmdBuf_, threadgroupCount.width, threadgroupCount.height, threadgroupCount.depth);
 }
@@ -2851,7 +2843,7 @@ void lvk::CommandBuffer::cmdDrawMeshTasksIndirect(BufferHandle indirectBuffer,
                                                   uint32_t drawCount,
                                                   uint32_t stride) {
   LVK_PROFILER_FUNCTION();
-  LVK_PROFILER_GPU_ZONE("cmdDrawMeshTasksIndirect()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
+  LVK_PROFILER_GPU_DRAW_ZONE("cmdDrawMeshTasksIndirect()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
 
   lvk::VulkanBuffer* bufIndirect = ctx_->buffersPool_.get(indirectBuffer);
 
@@ -2871,7 +2863,7 @@ void lvk::CommandBuffer::cmdDrawMeshTasksIndirectCount(BufferHandle indirectBuff
                                                        uint32_t maxDrawCount,
                                                        uint32_t stride) {
   LVK_PROFILER_FUNCTION();
-  LVK_PROFILER_GPU_ZONE("cmdDrawMeshTasksIndirectCount()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
+  LVK_PROFILER_GPU_DRAW_ZONE("cmdDrawMeshTasksIndirectCount()", ctx_, wrapper_->cmdBuf_, LVK_PROFILER_COLOR_CMD_DRAW);
 
   lvk::VulkanBuffer* bufIndirect = ctx_->buffersPool_.get(indirectBuffer);
   lvk::VulkanBuffer* bufCount = ctx_->buffersPool_.get(countBuffer);
