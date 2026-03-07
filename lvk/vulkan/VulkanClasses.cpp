@@ -5,7 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define VMA_IMPLEMENTATION
@@ -1134,28 +1137,102 @@ lvk::VulkanSwapchain::VulkanSwapchain(VulkanContext& ctx, uint32_t width, uint32
       ctx.getVkPhysicalDevice(), ctx.deviceQueues_.graphicsQueueFamilyIndex, ctx.vkSurface_, &queueFamilySupportsPresentation));
   LVK_ASSERT_MSG(queueFamilySupportsPresentation == VK_TRUE, "The queue family used with the swapchain does not support presentation");
 
-  auto chooseSwapImageCount = [](const VkSurfaceCapabilitiesKHR& caps) -> uint32_t {
-    const uint32_t desired = caps.minImageCount + 1;
+  auto chooseSwapImageCount = [](const VkSurfaceCapabilitiesKHR& caps, VkPresentModeKHR presentMode) -> uint32_t {
+    uint32_t desired = caps.minImageCount + 1;
+    if (presentMode == VK_PRESENT_MODE_FIFO_KHR || presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ||
+        presentMode == VK_PRESENT_MODE_MAILBOX_KHR) {
+      // Keep one more image queued for paced present modes to reduce CPU-side
+      // acquire stalls under heavy render loads.
+      desired = caps.minImageCount + 2;
+    }
     const bool exceeded = caps.maxImageCount > 0 && desired > caps.maxImageCount;
     return exceeded ? caps.maxImageCount : desired;
   };
 
   auto chooseSwapPresentMode = [](const std::vector<VkPresentModeKHR>& modes) -> VkPresentModeKHR {
-#if defined(__linux__) || defined(_M_ARM64)
-    if (std::find(modes.cbegin(), modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.cend()) {
-      return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    auto hasMode = [&modes](VkPresentModeKHR mode) -> bool { return std::find(modes.cbegin(), modes.cend(), mode) != modes.cend(); };
+    auto readEnvString = [](const char* name) -> std::string {
+#if defined(_WIN32)
+      char* raw = nullptr;
+      size_t len = 0;
+      if (_dupenv_s(&raw, &len, name) != 0 || raw == nullptr) {
+        return {};
+      }
+      std::string out = raw[0] != '\0' ? std::string(raw) : std::string{};
+      std::free(raw);
+      return out;
+#else
+      const char* raw = std::getenv(name);
+      if (!raw || !raw[0]) {
+        return {};
+      }
+      return std::string(raw);
+#endif
+    };
+    auto parseModeOverride = [](const char* raw) -> VkPresentModeKHR {
+      if (!raw || !raw[0]) {
+        return VK_PRESENT_MODE_MAX_ENUM_KHR;
+      }
+
+      std::string value(raw);
+      for (char& ch : value) {
+        ch = static_cast<char>(::tolower(static_cast<unsigned char>(ch)));
+      }
+
+      if (value == "immediate") {
+        return VK_PRESENT_MODE_IMMEDIATE_KHR;
+      }
+      if (value == "mailbox") {
+        return VK_PRESENT_MODE_MAILBOX_KHR;
+      }
+      if (value == "fifo_relaxed") {
+        return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+      }
+      if (value == "fifo") {
+        return VK_PRESENT_MODE_FIFO_KHR;
+      }
+      if (value == "auto") {
+        return VK_PRESENT_MODE_MAX_ENUM_KHR;
+      }
+      return VK_PRESENT_MODE_MAX_ENUM_KHR;
+    };
+    std::string modeOverride = readEnvString("NURI_PRESENT_MODE");
+    if (modeOverride.empty()) {
+      modeOverride = readEnvString("LVK_PRESENT_MODE");
     }
-#endif // __linux__
-    if (std::find(modes.cbegin(), modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.cend()) {
+    if (!modeOverride.empty()) {
+      const VkPresentModeKHR forcedMode = parseModeOverride(modeOverride.c_str());
+      if (forcedMode != VK_PRESENT_MODE_MAX_ENUM_KHR && hasMode(forcedMode)) {
+        return forcedMode;
+      }
+    }
+
+    // Default to paced mailbox when available for low-latency + tear-free
+    // presentation. Immediate remains available as an explicit env override.
+    if (hasMode(VK_PRESENT_MODE_MAILBOX_KHR)) {
       return VK_PRESENT_MODE_MAILBOX_KHR;
     }
-    if (std::find(modes.cbegin(), modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.cend()) {
+    if (hasMode(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
       return VK_PRESENT_MODE_IMMEDIATE_KHR;
     }
-    if (std::find(modes.cbegin(), modes.cend(), VK_PRESENT_MODE_FIFO_RELAXED_KHR) != modes.cend()) {
+    if (hasMode(VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
       return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
     }
     return VK_PRESENT_MODE_FIFO_KHR;
+  };
+  auto presentModeToString = [](VkPresentModeKHR mode) -> const char* {
+    switch (mode) {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR:
+      return "IMMEDIATE";
+    case VK_PRESENT_MODE_MAILBOX_KHR:
+      return "MAILBOX";
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+      return "FIFO_RELAXED";
+    case VK_PRESENT_MODE_FIFO_KHR:
+      return "FIFO";
+    default:
+      return "UNKNOWN";
+    }
   };
 
   VkSurfaceCapabilitiesKHR caps = {};
@@ -1186,6 +1263,8 @@ lvk::VulkanSwapchain::VulkanSwapchain(VulkanContext& ctx, uint32_t width, uint32
   const VkImageUsageFlags usageFlags = chooseUsageFlags(caps, props.formatProperties);
   const bool isCompositeAlphaOpaqueSupported = (ctx.deviceSurfaceCaps_.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0;
   const VkPresentModeKHR presentMode = chooseSwapPresentMode(ctx.devicePresentModes_);
+  const uint32_t swapchainImageCount = chooseSwapImageCount(ctx.deviceSurfaceCaps_, presentMode);
+  LLOGL("Swapchain present mode: %s (%u images)\n", presentModeToString(presentMode), swapchainImageCount);
   const VkSwapchainPresentModesCreateInfoKHR pmci = {
       .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR,
       .presentModeCount = 1,
@@ -1195,7 +1274,7 @@ lvk::VulkanSwapchain::VulkanSwapchain(VulkanContext& ctx, uint32_t width, uint32
       .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
       .pNext = ctx.has_KHR_swapchain_maintenance1_ ? &pmci : nullptr,
       .surface = ctx.vkSurface_,
-      .minImageCount = chooseSwapImageCount(ctx.deviceSurfaceCaps_),
+      .minImageCount = swapchainImageCount,
       .imageFormat = surfaceFormat_.format,
       .imageColorSpace = surfaceFormat_.colorSpace,
       .imageExtent = {.width = width, .height = height},
@@ -1335,17 +1414,13 @@ lvk::TextureHandle lvk::VulkanSwapchain::getCurrentTexture() {
     }
     LVK_PROFILER_ZONE_END();
 
-    LVK_PROFILER_ZONE("swapchain.timeline_wait", LVK_PROFILER_COLOR_WAIT);
-    const VkSemaphoreWaitInfo waitInfo = {
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-        .semaphoreCount = 1,
-        .pSemaphores = &ctx_.timelineSemaphore_,
-        .pValues = &timelineWaitValues_[currentImageIndex_],
-    };
-    // Wait for prior GPU work that targeted the acquired image index.
-    VK_ASSERT(vkWaitSemaphores(device_, &waitInfo, UINT64_MAX));
-    LVK_PROFILER_ZONE_END();
+    const uint64_t timelineWaitValue = timelineWaitValues_[currentImageIndex_];
     getNextImage_ = false;
+    if (timelineWaitValue > 0) {
+      // Queue-side timeline wait keeps swapchain image reuse ordering without
+      // blocking the CPU thread in vkWaitSemaphores().
+      ctx_.immediate_->waitSemaphore(ctx_.timelineSemaphore_, timelineWaitValue);
+    }
     ctx_.immediate_->waitSemaphore(acquireSemaphore);
   }
 
@@ -1374,9 +1449,8 @@ lvk::Result lvk::VulkanSwapchain::present(VkSemaphore waitSemaphore) {
   LVK_PROFILER_ZONE("vkQueuePresent()", LVK_PROFILER_COLOR_PRESENT);
   const VkPresentInfoKHR pi = {
       .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-      // Presentation fence chaining is intentionally disabled here.
-      // Acquire-fence/timeline synchronization in getCurrentTexture() keeps
-      // swapchain image reuse and GPU completion ordering correct.
+      // Presentation fence chaining is intentionally disabled here; image reuse
+      // ordering is enforced via queued timeline waits in getCurrentTexture().
       .pNext = nullptr,
       .waitSemaphoreCount = 1,
       .pWaitSemaphores = &waitSemaphore,
@@ -1605,10 +1679,10 @@ lvk::SubmitHandle lvk::VulkanImmediateCommands::submit(const CommandBufferWrappe
   LVK_ASSERT(wrapper.isEncoding_);
   VK_ASSERT(vkEndCommandBuffer(wrapper.cmdBuf_));
 
-  VkSemaphoreSubmitInfo waitSemaphores[] = {{}, {}};
+  VkSemaphoreSubmitInfo waitSemaphores[kMaxExtraWaitSemaphores + 1] = {};
   uint32_t numWaitSemaphores = 0;
-  if (waitSemaphore_.semaphore) {
-    waitSemaphores[numWaitSemaphores++] = waitSemaphore_;
+  for (uint32_t i = 0; i < numWaitSemaphores_; ++i) {
+    waitSemaphores[numWaitSemaphores++] = waitSemaphores_[i];
   }
   if (lastSubmitSemaphore_.semaphore) {
     waitSemaphores[numWaitSemaphores++] = lastSubmitSemaphore_;
@@ -1715,7 +1789,7 @@ lvk::SubmitHandle lvk::VulkanImmediateCommands::submit(const CommandBufferWrappe
 
   lastSubmitSemaphore_.semaphore = wrapper.semaphore_;
   lastSubmitHandle_ = wrapper.handle_;
-  waitSemaphore_.semaphore = VK_NULL_HANDLE;
+  numWaitSemaphores_ = 0;
   signalSemaphore_.semaphore = VK_NULL_HANDLE;
 
   // reset
@@ -1730,10 +1804,18 @@ lvk::SubmitHandle lvk::VulkanImmediateCommands::submit(const CommandBufferWrappe
   return lastSubmitHandle_;
 }
 
-void lvk::VulkanImmediateCommands::waitSemaphore(VkSemaphore semaphore) {
-  LVK_ASSERT(waitSemaphore_.semaphore == VK_NULL_HANDLE);
+void lvk::VulkanImmediateCommands::waitSemaphore(VkSemaphore semaphore, uint64_t waitValue) {
+  LVK_ASSERT(numWaitSemaphores_ < kMaxExtraWaitSemaphores);
+  if (numWaitSemaphores_ >= kMaxExtraWaitSemaphores) {
+    return;
+  }
 
-  waitSemaphore_.semaphore = semaphore;
+  waitSemaphores_[numWaitSemaphores_++] = VkSemaphoreSubmitInfo{
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+      .semaphore = semaphore,
+      .value = waitValue,
+      .stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+  };
 }
 
 void lvk::VulkanImmediateCommands::signalSemaphore(VkSemaphore semaphore, uint64_t signalValue) {
@@ -7224,7 +7306,8 @@ lvk::Result lvk::VulkanContext::initContext(const HWDeviceDesc& desc) {
 
 #if defined(LVK_WITH_TRACY_GPU)
   const PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT fpGetPhysicalDeviceCalibrateableTimeDomainsEXT =
-      (PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT)vkGetInstanceProcAddr(vkInstance_, "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
+      (PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT)vkGetInstanceProcAddr(vkInstance_,
+                                                                                "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
   const PFN_vkGetCalibratedTimestampsEXT fpGetCalibratedTimestampsEXT =
       (PFN_vkGetCalibratedTimestampsEXT)vkGetDeviceProcAddr(vkDevice_, "vkGetCalibratedTimestampsEXT");
   const PFN_vkResetQueryPoolEXT fpResetQueryPoolEXT = (PFN_vkResetQueryPoolEXT)vkGetDeviceProcAddr(vkDevice_, "vkResetQueryPool");
