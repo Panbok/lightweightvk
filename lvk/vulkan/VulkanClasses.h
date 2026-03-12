@@ -12,6 +12,7 @@
 
 #include <future>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace lvk {
@@ -357,6 +358,8 @@ class CommandBuffer final : public ICommandBuffer {
 
   void transitionToShaderReadOnly(TextureHandle surface) const override;
   void transitionToRenderingLocalRead(TextureHandle surface) const override;
+  void transitionTextureLayout(TextureHandle surface,
+                               VkImageLayout newImageLayout) const;
 
   void cmdBindRayTracingPipeline(lvk::RayTracingPipelineHandle handle) override;
 
@@ -431,9 +434,12 @@ class CommandBuffer final : public ICommandBuffer {
     return wrapper_ ? wrapper_->cmdBuf_ : VK_NULL_HANDLE;
   }
 
+  void bufferBarrier(BufferHandle handle,
+                     VkPipelineStageFlags2 srcStage,
+                     VkPipelineStageFlags2 dstStage);
+
  private:
   void useComputeTexture(TextureHandle texture, VkPipelineStageFlags2 dstStage);
-  void bufferBarrier(BufferHandle handle, VkPipelineStageFlags2 srcStage, VkPipelineStageFlags2 dstStage);
 
  private:
   friend class VulkanContext;
@@ -518,7 +524,9 @@ class VulkanContext final : public IContext {
   ICommandBuffer& acquireCommandBuffer() override;
 
   SubmitHandle submit(lvk::ICommandBuffer& commandBuffer, TextureHandle present) override;
+  void discard(ICommandBuffer& commandBuffer) override;
   void wait(SubmitHandle handle) override;
+  [[nodiscard]] bool isReady(SubmitHandle handle) const override;
 
   Holder<BufferHandle> createBuffer(const BufferDesc& desc, const char* debugName, Result* outResult) override;
   Holder<SamplerHandle> createSampler(const SamplerStateDesc& desc, Result* outResult) override;
@@ -581,9 +589,12 @@ class VulkanContext final : public IContext {
 
   ///////////////
 
-  VkPipeline getVkPipeline(ComputePipelineHandle handle);
-  VkPipeline getVkPipeline(RenderPipelineHandle handle, uint32_t viewMask);
-  VkPipeline getVkPipeline(RayTracingPipelineHandle handle);
+  VkPipeline getVkPipeline(ComputePipelineHandle handle,
+                           size_t descriptorSetIndex);
+  VkPipeline getVkPipeline(RenderPipelineHandle handle, uint32_t viewMask,
+                           size_t descriptorSetIndex);
+  VkPipeline getVkPipeline(RayTracingPipelineHandle handle,
+                           size_t descriptorSetIndex);
 
   uint32_t queryDevices(HWDeviceDesc* outDevices, uint32_t maxOutDevices = 1);
   lvk::Result initContext(const HWDeviceDesc& desc);
@@ -627,8 +638,11 @@ class VulkanContext final : public IContext {
 
   void* getVmaAllocator() const;
 
-  void checkAndUpdateDescriptorSets();
-  void bindDefaultDescriptorSets(VkCommandBuffer cmdBuf, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
+  size_t checkAndUpdateDescriptorSets();
+  void bindDefaultDescriptorSets(VkCommandBuffer cmdBuf,
+                                 VkPipelineBindPoint bindPoint,
+                                 VkPipelineLayout layout,
+                                 size_t descriptorSetIndex) const;
 
   [[nodiscard]] uint32_t getMaxStorageBufferRange() const override;
 
@@ -739,6 +753,7 @@ class VulkanContext final : public IContext {
   VkDescriptorSetLayout dslInputAttachments_ = VK_NULL_HANDLE;
   std::vector<DescriptorSet> DSets_ = {};
   size_t lastUpdatedDSet_ = 0;
+  mutable std::mutex descriptorSetsMutex_;
   // don't use staging on devices with shared host-visible memory
   bool useStaging_ = true;
 

@@ -1103,7 +1103,9 @@ class IContext {
   virtual ICommandBuffer& acquireCommandBuffer() = 0;
 
   virtual SubmitHandle submit(ICommandBuffer& commandBuffer, TextureHandle present = {}) = 0;
+  virtual void discard(ICommandBuffer& commandBuffer) = 0;
   virtual void wait(SubmitHandle handle) = 0; // waiting on an empty handle results in vkDeviceWaitIdle()
+  [[nodiscard]] virtual bool isReady(SubmitHandle handle) const = 0;
 
   [[nodiscard]] virtual Holder<BufferHandle> createBuffer(const BufferDesc& desc,
                                                           const char* debugName = nullptr,

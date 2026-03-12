@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -746,8 +747,10 @@ struct VulkanContextImpl final {
   // Vulkan Memory Allocator
   VmaAllocator vma_ = VK_NULL_HANDLE;
 
-  lvk::CommandBuffer currentCommandBuffer_;
+  std::mutex activeCommandBuffersMutex_;
+  std::vector<std::unique_ptr<lvk::CommandBuffer>> activeCommandBuffers_;
 
+  mutable std::mutex deferredTasksMutex_;
   std::vector<DeferredTask> deferredTasks_;
 
   struct YcbcrConversionData {
@@ -1138,11 +1141,60 @@ lvk::VulkanSwapchain::VulkanSwapchain(VulkanContext& ctx, uint32_t width, uint32
   LVK_ASSERT_MSG(queueFamilySupportsPresentation == VK_TRUE, "The queue family used with the swapchain does not support presentation");
 
   auto chooseSwapImageCount = [](const VkSurfaceCapabilitiesKHR& caps, VkPresentModeKHR presentMode) -> uint32_t {
+    auto readEnvImageCount = [](const char* name) -> uint32_t {
+#if defined(_WIN32)
+      char* raw = nullptr;
+      size_t len = 0;
+      if (_dupenv_s(&raw, &len, name) != 0 || raw == nullptr) {
+        return 0u;
+      }
+      char* end = nullptr;
+      const unsigned long parsed = std::strtoul(raw, &end, 10);
+      std::free(raw);
+      if (end == raw || parsed == 0ul) {
+        return 0u;
+      }
+      return static_cast<uint32_t>(std::min<unsigned long>(parsed, 16ul));
+#else
+      const char* raw = std::getenv(name);
+      if (!raw || !raw[0]) {
+        return 0u;
+      }
+      char* end = nullptr;
+      const unsigned long parsed = std::strtoul(raw, &end, 10);
+      if (end == raw || parsed == 0ul) {
+        return 0u;
+      }
+      return static_cast<uint32_t>(std::min<unsigned long>(parsed, 16ul));
+#endif
+    };
+
+    const uint32_t overrideCount = [readEnvImageCount]() -> uint32_t {
+      const uint32_t nuriCount = readEnvImageCount("NURI_SWAPCHAIN_IMAGE_COUNT");
+      if (nuriCount != 0u) {
+        return nuriCount;
+      }
+      return readEnvImageCount("LVK_SWAPCHAIN_IMAGE_COUNT");
+    }();
+
+    if (overrideCount != 0u) {
+      const uint32_t minCount = std::max(1u, caps.minImageCount);
+      const uint32_t clampedCount =
+          caps.maxImageCount > 0u
+              ? std::clamp(overrideCount, minCount, caps.maxImageCount)
+              : std::max(overrideCount, minCount);
+      return clampedCount;
+    }
+
     uint32_t desired = caps.minImageCount + 1;
-    if (presentMode == VK_PRESENT_MODE_FIFO_KHR || presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ||
+    if (presentMode == VK_PRESENT_MODE_FIFO_KHR ||
+        presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ||
+        presentMode == VK_PRESENT_MODE_MAILBOX_KHR ||
+        presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ||
         presentMode == VK_PRESENT_MODE_MAILBOX_KHR) {
       // Keep one more image queued for paced present modes to reduce CPU-side
-      // acquire stalls under heavy render loads.
+      // acquire stalls under heavy render loads. Immediate also benefits here:
+      // without the extra image, CPU submission often throttles on image reuse.
       desired = caps.minImageCount + 2;
     }
     const bool exceeded = caps.maxImageCount > 0 && desired > caps.maxImageCount;
@@ -2162,6 +2214,17 @@ void lvk::CommandBuffer::transitionToRenderingLocalRead(TextureHandle handle) co
                        VkImageSubresourceRange{flags, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS});
 }
 
+void lvk::CommandBuffer::transitionTextureLayout(TextureHandle handle,
+                                                 VkImageLayout newImageLayout) const {
+  LVK_PROFILER_FUNCTION_COLOR(LVK_PROFILER_COLOR_BARRIER);
+
+  lvk::VulkanImage& img = *ctx_->texturesPool_.get(handle);
+  const VkImageAspectFlags flags = img.getImageAspectFlags();
+  img.transitionLayout(wrapper_->cmdBuf_,
+                       newImageLayout,
+                       VkImageSubresourceRange{flags, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS});
+}
+
 void lvk::CommandBuffer::cmdBindRayTracingPipeline(lvk::RayTracingPipelineHandle handle) {
   LVK_PROFILER_FUNCTION();
 
@@ -2173,7 +2236,8 @@ void lvk::CommandBuffer::cmdBindRayTracingPipeline(lvk::RayTracingPipelineHandle
   currentPipelineCompute_ = {};
   currentPipelineRayTracing_ = handle;
 
-  VkPipeline pipeline = ctx_->getVkPipeline(handle);
+  const size_t descriptorSetIndex = ctx_->checkAndUpdateDescriptorSets();
+  VkPipeline pipeline = ctx_->getVkPipeline(handle, descriptorSetIndex);
 
   const lvk::RayTracingPipelineState* rtps = ctx_->rayTracingPipelinesPool_.get(handle);
 
@@ -2183,9 +2247,11 @@ void lvk::CommandBuffer::cmdBindRayTracingPipeline(lvk::RayTracingPipelineHandle
   if (lastPipelineBound_ != pipeline) {
     lastPipelineBound_ = pipeline;
     vkCmdBindPipeline(wrapper_->cmdBuf_, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
-    ctx_->checkAndUpdateDescriptorSets();
-    ctx_->bindDefaultDescriptorSets(wrapper_->cmdBuf_, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rtps->pipelineLayout_);
   }
+  ctx_->bindDefaultDescriptorSets(wrapper_->cmdBuf_,
+                                  VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                  rtps->pipelineLayout_,
+                                  descriptorSetIndex);
 }
 
 void lvk::CommandBuffer::cmdBindComputePipeline(lvk::ComputePipelineHandle handle) {
@@ -2199,7 +2265,8 @@ void lvk::CommandBuffer::cmdBindComputePipeline(lvk::ComputePipelineHandle handl
   currentPipelineCompute_ = handle;
   currentPipelineRayTracing_ = {};
 
-  VkPipeline pipeline = ctx_->getVkPipeline(handle);
+  const size_t descriptorSetIndex = ctx_->checkAndUpdateDescriptorSets();
+  VkPipeline pipeline = ctx_->getVkPipeline(handle, descriptorSetIndex);
 
   const lvk::ComputePipelineState* cps = ctx_->computePipelinesPool_.get(handle);
 
@@ -2209,9 +2276,11 @@ void lvk::CommandBuffer::cmdBindComputePipeline(lvk::ComputePipelineHandle handl
   if (lastPipelineBound_ != pipeline) {
     lastPipelineBound_ = pipeline;
     vkCmdBindPipeline(wrapper_->cmdBuf_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-    ctx_->checkAndUpdateDescriptorSets();
-    ctx_->bindDefaultDescriptorSets(wrapper_->cmdBuf_, VK_PIPELINE_BIND_POINT_COMPUTE, cps->pipelineLayout_);
   }
+  ctx_->bindDefaultDescriptorSets(wrapper_->cmdBuf_,
+                                  VK_PIPELINE_BIND_POINT_COMPUTE,
+                                  cps->pipelineLayout_,
+                                  descriptorSetIndex);
 }
 
 void lvk::CommandBuffer::cmdDispatchThreadGroups(const Dimensions& threadgroupCount, const Dependencies& deps) {
@@ -2319,11 +2388,23 @@ void lvk::CommandBuffer::bufferBarrier(BufferHandle handle, VkPipelineStageFlags
   } else {
     barrier.srcAccessMask |= VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
   }
+  if ((srcStage & VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT) && (buf->vkUsageFlags_ & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)) {
+    barrier.srcAccessMask |= VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+  }
+  if ((srcStage & VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT) && (buf->vkUsageFlags_ & VK_BUFFER_USAGE_INDEX_BUFFER_BIT)) {
+    barrier.srcAccessMask |= VK_ACCESS_2_INDEX_READ_BIT;
+  }
+  if (srcStage & VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT) {
+    barrier.srcAccessMask |= VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+  }
 
   if (dstStage & VK_PIPELINE_STAGE_2_TRANSFER_BIT) {
     barrier.dstAccessMask |= VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
   } else {
     barrier.dstAccessMask |= VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+  }
+  if ((dstStage & VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT) && (buf->vkUsageFlags_ & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)) {
+    barrier.dstAccessMask |= VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
   }
   if (dstStage & VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT) {
     barrier.dstAccessMask |= VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
@@ -2553,8 +2634,6 @@ void lvk::CommandBuffer::cmdBeginRendering(const lvk::RenderPass& renderPass, co
   cmdBindScissorRect(scissor);
   cmdBindDepthState({});
 
-  ctx_->checkAndUpdateDescriptorSets();
-
   vkCmdSetDepthCompareOp(wrapper_->cmdBuf_, VK_COMPARE_OP_ALWAYS);
   vkCmdSetDepthBiasEnable(wrapper_->cmdBuf_, VK_FALSE);
 
@@ -2634,22 +2713,27 @@ void lvk::CommandBuffer::cmdBindRenderPipeline(lvk::RenderPipelineHandle handle)
     LLOGW("Make sure your render pass and render pipeline both have matching depth attachments");
   }
 
-  VkPipeline pipeline = ctx_->getVkPipeline(handle, viewMask_);
+  const size_t descriptorSetIndex = ctx_->checkAndUpdateDescriptorSets();
+  VkPipeline pipeline = ctx_->getVkPipeline(handle, viewMask_,
+                                            descriptorSetIndex);
 
   LVK_ASSERT(pipeline != VK_NULL_HANDLE);
 
   if (lastPipelineBound_ != pipeline) {
     lastPipelineBound_ = pipeline;
     vkCmdBindPipeline(wrapper_->cmdBuf_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    ctx_->bindDefaultDescriptorSets(wrapper_->cmdBuf_, VK_PIPELINE_BIND_POINT_GRAPHICS, rps->pipelineLayout_);
-    if (inputAttachments_.count) {
-      vkCmdPushDescriptorSetKHR(wrapper_->cmdBuf_,
-                                VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                rps->pipelineLayout_,
-                                kDescriptorSet_InputAttachments,
-                                inputAttachments_.count,
-                                inputAttachments_.writes);
-    }
+  }
+  ctx_->bindDefaultDescriptorSets(wrapper_->cmdBuf_,
+                                  VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  rps->pipelineLayout_,
+                                  descriptorSetIndex);
+  if (inputAttachments_.count) {
+    vkCmdPushDescriptorSetKHR(wrapper_->cmdBuf_,
+                              VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              rps->pipelineLayout_,
+                              kDescriptorSet_InputAttachments,
+                              inputAttachments_.count,
+                              inputAttachments_.writes);
   }
 }
 
@@ -3955,15 +4039,17 @@ lvk::VulkanContext::~VulkanContext() {
 lvk::ICommandBuffer& lvk::VulkanContext::acquireCommandBuffer() {
   LVK_PROFILER_FUNCTION();
 
-  LVK_ASSERT_MSG(!pimpl_->currentCommandBuffer_.ctx_, "Cannot acquire more than 1 command buffer simultaneously");
-
 #if defined(_M_ARM64)
   vkDeviceWaitIdle(vkDevice_); // a temporary workaround for Windows on Snapdragon
 #endif
 
-  pimpl_->currentCommandBuffer_ = CommandBuffer(this);
-
-  return pimpl_->currentCommandBuffer_;
+  auto commandBuffer = std::make_unique<CommandBuffer>(this);
+  ICommandBuffer& result = *commandBuffer;
+  {
+    std::lock_guard lock(pimpl_->activeCommandBuffersMutex_);
+    pimpl_->activeCommandBuffers_.push_back(std::move(commandBuffer));
+  }
+  return result;
 }
 
 lvk::SubmitHandle lvk::VulkanContext::submit(lvk::ICommandBuffer& commandBuffer, TextureHandle present) {
@@ -4021,14 +4107,50 @@ lvk::SubmitHandle lvk::VulkanContext::submit(lvk::ICommandBuffer& commandBuffer,
     DSets_[idx].handle_ = handle;
   }
 
-  // reset
-  pimpl_->currentCommandBuffer_ = {};
+  {
+    std::lock_guard lock(pimpl_->activeCommandBuffersMutex_);
+    for (auto it = pimpl_->activeCommandBuffers_.begin();
+         it != pimpl_->activeCommandBuffers_.end(); ++it) {
+      if (it->get() == vkCmdBuffer) {
+        pimpl_->activeCommandBuffers_.erase(it);
+        break;
+      }
+    }
+  }
 
   return handle;
 }
 
+void lvk::VulkanContext::discard(ICommandBuffer& commandBuffer) {
+  LVK_PROFILER_FUNCTION();
+
+  CommandBuffer* vkCmdBuffer = static_cast<CommandBuffer*>(&commandBuffer);
+  LVK_ASSERT(vkCmdBuffer);
+  LVK_ASSERT(vkCmdBuffer->ctx_);
+  LVK_ASSERT(vkCmdBuffer->wrapper_);
+
+  const_cast<VulkanImmediateCommands::CommandBufferWrapper*>(
+      vkCmdBuffer->wrapper_)
+      ->isEncoding_ = false;
+
+  {
+    std::lock_guard lock(pimpl_->activeCommandBuffersMutex_);
+    for (auto it = pimpl_->activeCommandBuffers_.begin();
+         it != pimpl_->activeCommandBuffers_.end(); ++it) {
+      if (it->get() == vkCmdBuffer) {
+        pimpl_->activeCommandBuffers_.erase(it);
+        break;
+      }
+    }
+  }
+}
+
 void lvk::VulkanContext::wait(SubmitHandle handle) {
   immediate_->wait(handle);
+}
+
+bool lvk::VulkanContext::isReady(SubmitHandle handle) const {
+  return immediate_->isReady(handle);
 }
 
 lvk::Holder<lvk::BufferHandle> lvk::VulkanContext::createBuffer(const BufferDesc& requestedDesc, const char* debugName, Result* outResult) {
@@ -4875,16 +4997,16 @@ const VkSamplerYcbcrConversionInfo* lvk::VulkanContext::getOrCreateYcbcrConversi
   return &pimpl_->ycbcrConversionData_[format].info;
 }
 
-VkPipeline lvk::VulkanContext::getVkPipeline(RenderPipelineHandle handle, uint32_t viewMask) {
+VkPipeline lvk::VulkanContext::getVkPipeline(RenderPipelineHandle handle,
+                                             uint32_t viewMask,
+                                             size_t descriptorSetIndex) {
   lvk::RenderPipelineState* rps = renderPipelinesPool_.get(handle);
 
   if (!rps) {
     return VK_NULL_HANDLE;
   }
 
-  checkAndUpdateDescriptorSets();
-
-  const DescriptorSet& dset = DSets_[lastUpdatedDSet_];
+  const DescriptorSet& dset = DSets_[descriptorSetIndex];
 
   if (rps->lastVkDescriptorSetLayout_ != dset.vkDSL || rps->viewMask_ != viewMask) {
     deferredTask(std::packaged_task<void()>(
@@ -5084,16 +5206,15 @@ VkPipeline lvk::VulkanContext::getVkPipeline(RenderPipelineHandle handle, uint32
   return pipeline;
 }
 
-VkPipeline lvk::VulkanContext::getVkPipeline(RayTracingPipelineHandle handle) {
+VkPipeline lvk::VulkanContext::getVkPipeline(RayTracingPipelineHandle handle,
+                                             size_t descriptorSetIndex) {
   lvk::RayTracingPipelineState* rtps = rayTracingPipelinesPool_.get(handle);
 
   if (!rtps) {
     return VK_NULL_HANDLE;
   }
 
-  checkAndUpdateDescriptorSets();
-
-  const DescriptorSet& dset = DSets_[lastUpdatedDSet_];
+  const DescriptorSet& dset = DSets_[descriptorSetIndex];
 
   if (rtps->lastVkDescriptorSetLayout_ != dset.vkDSL) {
     deferredTask(
@@ -5343,16 +5464,15 @@ VkPipeline lvk::VulkanContext::getVkPipeline(RayTracingPipelineHandle handle) {
   return rtps->pipeline_;
 }
 
-VkPipeline lvk::VulkanContext::getVkPipeline(ComputePipelineHandle handle) {
+VkPipeline lvk::VulkanContext::getVkPipeline(ComputePipelineHandle handle,
+                                             size_t descriptorSetIndex) {
   lvk::ComputePipelineState* cps = computePipelinesPool_.get(handle);
 
   if (!cps) {
     return VK_NULL_HANDLE;
   }
 
-  checkAndUpdateDescriptorSets();
-
-  const DescriptorSet& dset = DSets_[lastUpdatedDSet_];
+  const DescriptorSet& dset = DSets_[descriptorSetIndex];
 
   if (cps->lastVkDescriptorSetLayout_ != dset.vkDSL) {
     deferredTask(
@@ -7686,17 +7806,21 @@ lvk::BufferHandle lvk::VulkanContext::createBuffer(VkDeviceSize bufferSize,
   return buffersPool_.create(std::move(buf));
 }
 
-void lvk::VulkanContext::bindDefaultDescriptorSets(VkCommandBuffer cmdBuf, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
+void lvk::VulkanContext::bindDefaultDescriptorSets(VkCommandBuffer cmdBuf,
+                                                   VkPipelineBindPoint bindPoint,
+                                                   VkPipelineLayout layout,
+                                                   size_t descriptorSetIndex) const {
   LVK_PROFILER_FUNCTION();
-  const VkDescriptorSet dset = DSets_[lastUpdatedDSet_].vkDSet;
+  const VkDescriptorSet dset = DSets_[descriptorSetIndex].vkDSet;
   const VkDescriptorSet dsets[4] = {dset, dset, dset, dset};
   vkCmdBindDescriptorSets(cmdBuf, bindPoint, layout, 0, (uint32_t)LVK_ARRAY_NUM_ELEMENTS(dsets), dsets, 0, nullptr);
 }
 
-void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
+size_t lvk::VulkanContext::checkAndUpdateDescriptorSets() {
+  std::lock_guard lock(descriptorSetsMutex_);
   if (!awaitingCreation_) {
     // nothing to update here
-    return;
+    return lastUpdatedDSet_;
   }
 
   // newly created resources can be used immediately - make sure they are put into descriptor sets
@@ -7891,11 +8015,12 @@ void lvk::VulkanContext::checkAndUpdateDescriptorSets() {
     LLOGL("vkUpdateDescriptorSets()\n");
 #endif // LVK_VULKAN_PRINT_COMMANDS
     LVK_PROFILER_ZONE("vkUpdateDescriptorSets()", LVK_PROFILER_COLOR_PRESENT);
-    vkUpdateDescriptorSets(vkDevice_, numWrites, write, 0, nullptr);
-    LVK_PROFILER_ZONE_END();
+  vkUpdateDescriptorSets(vkDevice_, numWrites, write, 0, nullptr);
+  LVK_PROFILER_ZONE_END();
   }
 
   awaitingCreation_ = false;
+  return lastUpdatedDSet_;
 }
 
 lvk::SamplerHandle lvk::VulkanContext::createSampler(const VkSamplerCreateInfo& ci,
@@ -7983,6 +8108,7 @@ void lvk::VulkanContext::deferredTask(std::packaged_task<void()>&& task, SubmitH
   if (handle.empty()) {
     handle = immediate_->getNextSubmitHandle();
   }
+  std::lock_guard lock(pimpl_->deferredTasksMutex_);
   pimpl_->deferredTasks_.emplace_back(std::move(task), handle);
 }
 
@@ -7991,21 +8117,33 @@ void* lvk::VulkanContext::getVmaAllocator() const {
 }
 
 void lvk::VulkanContext::processDeferredTasks() const {
-  std::vector<DeferredTask>::iterator it = pimpl_->deferredTasks_.begin();
-
-  while (it != pimpl_->deferredTasks_.end() && immediate_->isReady(it->handle_, true)) {
-    (it++)->task_();
+  std::vector<DeferredTask> readyTasks;
+  {
+    std::lock_guard lock(pimpl_->deferredTasksMutex_);
+    auto it = pimpl_->deferredTasks_.begin();
+    while (it != pimpl_->deferredTasks_.end() &&
+           immediate_->isReady(it->handle_, true)) {
+      readyTasks.emplace_back(std::move(it->task_), it->handle_);
+      ++it;
+    }
+    pimpl_->deferredTasks_.erase(pimpl_->deferredTasks_.begin(), it);
   }
 
-  pimpl_->deferredTasks_.erase(pimpl_->deferredTasks_.begin(), it);
+  for (DeferredTask &task : readyTasks) {
+    task.task_();
+  }
 }
 
 void lvk::VulkanContext::waitDeferredTasks() {
-  for (auto& task : pimpl_->deferredTasks_) {
+  std::vector<DeferredTask> deferredTasks;
+  {
+    std::lock_guard lock(pimpl_->deferredTasksMutex_);
+    deferredTasks.swap(pimpl_->deferredTasks_);
+  }
+  for (auto& task : deferredTasks) {
     immediate_->wait(task.handle_);
     task.task_();
   }
-  pimpl_->deferredTasks_.clear();
 }
 
 uint32_t lvk::VulkanContext::getMaxStorageBufferRange() const {
