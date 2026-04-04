@@ -2297,7 +2297,9 @@ void lvk::CommandBuffer::cmdDispatchThreadGroups(const Dimensions& threadgroupCo
     LVK_ASSERT_MSG(buf->vkUsageFlags_ & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                    "Did you forget to specify BufferUsageBits_Storage on your buffer?");
     bufferBarrier(deps.buffers[i],
-                  VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
   }
 
@@ -6242,10 +6244,29 @@ lvk::ShaderModuleState lvk::VulkanContext::createShaderModuleFromGLSL(ShaderStag
     source = sourcePatched.c_str();
   }
 
+  const ShaderCompileCacheKey cacheKey{
+      .stage = stage,
+      .source = std::string(source),
+  };
+  {
+    std::scoped_lock lock(shaderCompileCacheMutex_);
+    if (const auto cached = glslShaderCompileCache_.find(cacheKey);
+        cached != glslShaderCompileCache_.end()) {
+      return createShaderModuleFromSPIRV(
+          cached->second.data(), cached->second.size(), debugName, outResult);
+    }
+  }
+
   const glslang_resource_t glslangResource = lvk::getGlslangResource(getVkPhysicalDeviceProperties().limits);
 
   std::vector<uint8_t> spirv;
-  lvk::Result::setResult(outResult, lvk::compileShaderGlslang(stage, source, &spirv, &glslangResource));
+  const lvk::Result compileResult =
+      lvk::compileShaderGlslang(stage, source, &spirv, &glslangResource);
+  lvk::Result::setResult(outResult, compileResult);
+  if (compileResult.isOk()) {
+    std::scoped_lock lock(shaderCompileCacheMutex_);
+    glslShaderCompileCache_.emplace(cacheKey, spirv);
+  }
 
   return createShaderModuleFromSPIRV(spirv.data(), spirv.size(), debugName, outResult);
 }

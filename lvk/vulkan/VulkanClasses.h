@@ -13,6 +13,8 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace lvk {
@@ -657,6 +659,21 @@ class VulkanContext final : public IContext {
     SubmitHandle handle_ = {}; // last use
   };
 
+  struct ShaderCompileCacheKey {
+    ShaderStage stage = ShaderStage::Stage_Vert;
+    std::string source{};
+
+    bool operator==(const ShaderCompileCacheKey&) const = default;
+  };
+
+  struct ShaderCompileCacheKeyHash {
+    size_t operator()(const ShaderCompileCacheKey& key) const noexcept {
+      const size_t stageHash = std::hash<uint32_t>{}(static_cast<uint32_t>(key.stage));
+      const size_t sourceHash = std::hash<std::string>{}(key.source);
+      return stageHash ^ (sourceHash + 0x9e3779b9u + (stageHash << 6u) + (stageHash >> 2u));
+    }
+  };
+
   void createInstance();
   void createSurface(void* window, void* display);
   void createHeadlessSurface();
@@ -754,6 +771,8 @@ class VulkanContext final : public IContext {
   std::vector<DescriptorSet> DSets_ = {};
   size_t lastUpdatedDSet_ = 0;
   mutable std::mutex descriptorSetsMutex_;
+  mutable std::mutex shaderCompileCacheMutex_;
+  mutable std::unordered_map<ShaderCompileCacheKey, std::vector<uint8_t>, ShaderCompileCacheKeyHash> glslShaderCompileCache_;
   // don't use staging on devices with shared host-visible memory
   bool useStaging_ = true;
 
